@@ -4,21 +4,30 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
+# we calculate next latent noise from previous latent noise
 def next_step(model, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
     timestep, next_timestep = min(timestep - model.scheduler.config.num_train_timesteps // model.scheduler.num_inference_steps, 999), timestep
-    alpha_prod_t = model.scheduler.alphas_cumprod[timestep] if timestep >= 0 else model.scheduler.final_alpha_cumprod
-    alpha_prod_t_next = model.scheduler.alphas_cumprod[next_timestep]
-    beta_prod_t = 1 - alpha_prod_t
-    next_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
-    next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
-    next_sample = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
+
+    // og_t = (prev_latent - sqrt(1 - a_t) * noise_pred) / sqrt(a_t)
+    // x(t) = sqrt(a_t_next) * og_t + sqrt(1 - a_t) * noise_pred
+
+    a_t = model.scheduler.alphas_cumprod[timestep] if timestep >= 0 else model.scheduler.final_alpha_cumprod
+    a_t_next = model.scheduler.alphas_cumprod[next_timestep]
+    b_t = 1 - a_t
+
+    next_original_sample = (sample - b_t** 0.5 * model_output) / a_t ** 0.5
+    next_sample_direction = (1 - a_t_next) ** 0.5 * model_output
+    next_sample = a_t_next ** 0.5 * next_original_sample + next_sample_direction
     return next_sample
 
 def get_noise_pred(model, latent, t, context, cfg_scale):
     latents_input = torch.cat([latent] * 2)
     noise_pred = model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
     noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
+
+    # now, we'll use the predicted noise result to perform guidance
     noise_pred = noise_pred_uncond + cfg_scale * (noise_prediction_text - noise_pred_uncond)
+
     # latents = next_step(model, noise_pred, t, latent)
     return noise_pred
 
@@ -28,11 +37,18 @@ def ddim_loop(model, w0, prompt, cfg_scale):
     # all_latent = [latent]
     text_embedding = encode_text(model, prompt)
     uncond_embedding = encode_text(model, "")
+
+    # concatenating the two embeddings
     context = torch.cat([uncond_embedding, text_embedding])
-    latent = w0.clone().detach()
+
+    # we are just copying the data
+    latent = w0.clone().detach()    
+
     for i in tqdm(range(model.scheduler.num_inference_steps)):
         t = model.scheduler.timesteps[len(model.scheduler.timesteps) - i - 1]
         noise_pred = get_noise_pred(model, latent, t, context, cfg_scale)
+
+        # noew, we'll calculate the next latent
         latent = next_step(model, noise_pred, t, latent)
         # all_latent.append(latent)
     return latent
